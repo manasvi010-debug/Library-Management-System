@@ -1,0 +1,126 @@
+import { createLogger, format, transports } from 'winston';
+
+export const logger = createLogger({
+  level: 'info',
+  format: format.combine(
+    format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+    format.errors({ stack: true }),
+    format.json()
+  ),
+  transports: [
+    new transports.Console({
+      format: format.combine(format.colorize(), format.simple())
+    }),
+    new transports.File({ filename: 'logs/error.log', level: 'error' })
+  ]
+});
+
+import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
+
+export interface AuthenticatedRequest extends Request {
+  user?: { userId: string };
+}
+
+export const authenticateToken = (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): void => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    res.status(401).json({ error: 'Access token required' });
+    return;
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret', (err, decoded) => {
+    if (err) {
+      res.status(403).json({ error: 'Invalid or expired token' });
+      return;
+    }
+    req.user = decoded as { userId: string };
+    next();
+  });
+};
+
+import { PrismaClient, Task, Status } from '@prisma/client';
+
+const prisma = new PrismaClient();
+
+export class TaskService {
+  static async createTask(userId: string, title: string, description?: string): Promise<Task> {
+    return prisma.task.create({
+      data: { title, description, userId }
+    });
+  }
+
+  static async getTasksForUser(userId: string): Promise<Task[]> {
+    return prisma.task.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' }
+    });
+  }
+
+  static async updateTaskStatus(taskId: string, userId: string, status: Status): Promise<Task> {
+    const task = await prisma.task.findUnique({ where: { id: taskId } });
+    if (!task || task.userId !== userId) {
+      throw new Error('Task not found or access denied');
+    }
+    return prisma.task.update({
+      where: { id: taskId },
+      data: { status }
+    });
+  }
+}
+
+import { Response } from 'express';
+import { AuthenticatedRequest } from '../middlewares/auth.middleware';
+import { TaskService } from '../services/task.service';
+import { z } from 'zod';
+
+const createTaskSchema = z.object({
+  title: z.string().min(1, 'Title is required'),
+  description: z.string().optional()
+});
+
+export const createTaskHandler = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const parsedBody = createTaskSchema.parse(req.body);
+    const task = await TaskService.createTask(userId, parsedBody.title, parsedBody.description);
+    
+    res.status(201).json({ data: task });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ error: error.errors });
+    } else {
+      res.status(500).json({ error: error.message || 'Internal Server Error' });
+    }
+  }
+};
+
+import { TaskService } from '../src/services/task.service';
+
+jest.mock('@prisma/client', () => {
+  const mPrisma = {
+    task: {
+      create: jest.fn().mockResolvedValue({ id: 'task-1', title: 'Test Task', userId: 'user-1' })
+    }
+  };
+  return { PrismaClient: jest.fn(() => mPrisma) };
+});
+
+describe('TaskService', () => {
+  it('should successfully create a task for a given user', async () => {
+    const task = await TaskService.createTask('user-1', 'Test Task');
+    expect(task).toHaveProperty('id', 'task-1');
+    expect(task.title).toBe('Test Task');
+  });
+});
